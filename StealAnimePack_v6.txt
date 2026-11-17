@@ -1,0 +1,679 @@
+-- ══════════════════════════════════════════════════════════════
+--  STEAL AN ANIME PACK — v6
+--  Built by @Archaes `78 | larp absolute
+--  UI: Fluent (dawid-scripts)
+--  Features (ALL SEPARATE):
+--    • Auto Steal  — scan rarity → tween directly to pack → steal → tween return to base (AC bypass)
+--    • Auto Farm   — combo click x2–x5 training buttons
+--    • Auto Hatch  — open/hatch pack buttons + remotes
+--    • Auto Place  — place pack in base buttons + remotes
+--    • Notif Hook  — detects rarity keyword in any GUI text → triggers steal immediately
+--    • Set Base    — saves current position as return point
+--    • Speed slider, AC bypass toggle, per-rarity tier toggles
+-- ══════════════════════════════════════════════════════════════
+
+-- ── SERVICES ──────────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+-- ── FLUENT LOAD ───────────────────────────────────────────────
+local Fluent = loadstring(game:HttpGet(
+    "https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"
+))()
+local SaveManager = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"
+))()
+local InterfaceManager = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"
+))()
+
+-- ── LOCALS ────────────────────────────────────────────────────
+local LP   = Players.LocalPlayer
+local Char = LP.Character or LP.CharacterAdded:Wait()
+local HRP  = Char:WaitForChild("HumanoidRootPart")
+local Hum  = Char:WaitForChild("Humanoid")
+
+-- ── CFG ───────────────────────────────────────────────────────
+local CFG = {
+    StealSpeed  = 500,
+    ComboDelay  = 0.012,
+    ACBypass    = true,
+    HopDist     = 12,
+    HopTime     = 0.03,
+    Tiers       = {
+        omniverse  = true,
+        eternal    = true,
+        primordial = true,
+        godlike    = true,
+    },
+}
+
+local State = {
+    Base        = nil,       -- CFrame, set by button or auto on spawn
+    FarmSpot    = nil,       -- CFrame
+    Stealing    = false,
+    Farming     = false,
+    Hatching    = false,
+    Placing     = false,
+    ActiveTween = nil,
+}
+
+-- ── CHAR REFRESH ──────────────────────────────────────────────
+local function refresh_char(c)
+    Char = c
+    HRP  = c:WaitForChild("HumanoidRootPart")
+    Hum  = c:WaitForChild("Humanoid")
+    if not State.Base then State.Base = HRP.CFrame end
+    if not State.FarmSpot then State.FarmSpot = HRP.CFrame end
+    task.wait(0.5)
+    Hum.WalkSpeed = CFG.StealSpeed
+    Hum.JumpPower = 0
+    pcall(function() HRP:SetNetworkOwner(nil) end)
+end
+LP.CharacterAdded:Connect(refresh_char)
+
+local function set_speed(v)
+    CFG.StealSpeed = math.clamp(v, 16, 2000)
+    Hum.WalkSpeed  = CFG.StealSpeed
+end
+
+-- ── REMOTE HELPER ─────────────────────────────────────────────
+local function fire_remote(name, ...)
+    local r = ReplicatedStorage:FindFirstChild(name, true)
+           or Workspace:FindFirstChild(name, true)
+    if not r then return end
+    if     r:IsA("RemoteEvent")    then r:FireServer(...)
+    elseif r:IsA("RemoteFunction") then return r:InvokeServer(...) end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  MOVEMENT — tween + AC bypass hop
+--  why hop: "Steal an Anime Pack" detects large CFrame deltas
+--  and teleports you back; small hops (<= HopDist) stay under
+--  the detection threshold. Each hop is a tween so it looks
+--  like legit movement to the velocity check.
+-- ══════════════════════════════════════════════════════════════
+local function cancel_tween()
+    if State.ActiveTween then
+        pcall(function() State.ActiveTween:Cancel() end)
+        State.ActiveTween = nil
+    end
+end
+
+local function do_tween(cf, t)
+    cancel_tween()
+    local tw = TweenService:Create(
+        HRP,
+        TweenInfo.new(t or 0.05, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+        {CFrame = cf}
+    )
+    State.ActiveTween = tw
+    tw:Play()
+    tw.Completed:Wait()
+    if State.ActiveTween == tw then State.ActiveTween = nil end
+end
+
+local function move_to(targetCF)
+    local origin = HRP.CFrame
+    local dist   = (targetCF.Position - origin.Position).Magnitude
+
+    if dist < 3 then
+        do_tween(targetCF, 0.05)
+        return
+    end
+
+    if not CFG.ACBypass or dist <= CFG.HopDist then
+        do_tween(targetCF, math.clamp(dist / 200, 0.05, 0.4))
+        return
+    end
+
+    -- hop in CFG.HopDist chunks, each a tween
+    local steps = math.ceil(dist / CFG.HopDist)
+    for i = 1, steps do
+        if not (State.Stealing or State.Placing) then break end
+        local hop = origin:Lerp(targetCF, i / steps)
+        do_tween(hop, CFG.HopTime)
+        -- if server kicked us back, snap to hop and retry once
+        local drift = (HRP.CFrame.Position - hop.Position).Magnitude
+        if drift > 16 then
+            task.wait(0.08)
+            cancel_tween()
+            HRP.CFrame = hop
+            task.wait(0.03)
+        end
+    end
+
+    -- final snap to guarantee arrival
+    cancel_tween()
+    HRP.CFrame = targetCF
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  TIER DETECTION
+-- ══════════════════════════════════════════════════════════════
+local function str_has_tier(str)
+    local low = str:lower()
+    for tier in pairs(CFG.Tiers) do
+        if low:find(tier, 1, true) then return true end
+    end
+    return false
+end
+
+local function obj_matches_tier(obj)
+    if str_has_tier(obj.Name) then return true end
+    for _, ch in ipairs(obj:GetChildren()) do
+        if ch:IsA("StringValue") or ch:IsA("TextLabel") or ch:IsA("TextBox") then
+            local v = ch:IsA("StringValue") and ch.Value or ch.Text
+            if v and str_has_tier(v) then return true end
+        end
+    end
+    return false
+end
+
+local function get_targets()
+    local out = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if (obj:IsA("Model") or obj:IsA("BasePart")) and obj_matches_tier(obj) then
+            local part = obj:IsA("BasePart") and obj
+                      or obj:FindFirstChildWhichIsA("BasePart")
+            if part then
+                table.insert(out, {model = obj, part = part})
+            end
+        end
+    end
+    return out
+end
+
+local function nearest_target()
+    local best, bd = nil, math.huge
+    for _, t in ipairs(get_targets()) do
+        local d = (t.part.Position - HRP.Position).Magnitude
+        if d < bd then bd = d; best = t end
+    end
+    return best
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  BASE FIND
+-- ══════════════════════════════════════════════════════════════
+local function get_base_cf()
+    if State.Base then return State.Base end
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BasePart") then
+            local n  = obj.Name:lower()
+            local ok = n:find("base",1,true) or n:find("plot",1,true) or n:find("spawn",1,true)
+            if ok then
+                local ow = obj:FindFirstChild("Owner") or obj:FindFirstChild("PlayerName")
+                if ow and (tostring(ow.Value) == LP.Name
+                        or tostring(ow.Value) == tostring(LP.UserId)) then
+                    return obj.CFrame + Vector3.new(0, 5, 0)
+                end
+            end
+        end
+    end
+    return HRP.CFrame
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  GUI SKIP & BUTTON FIRE
+-- ══════════════════════════════════════════════════════════════
+local GUI_ROOTS = {"Fluent", "LarpGUI"}
+
+local function is_own_gui(obj)
+    local p = obj
+    while p do
+        for _, n in ipairs(GUI_ROOTS) do
+            if p.Name == n then return true end
+        end
+        p = p.Parent
+    end
+    return false
+end
+
+local function fire_btn(btn)
+    pcall(function()
+        for _, c in ipairs(getconnections(btn.MouseButton1Click)) do
+            if c.Function then c.Function() end
+        end
+    end)
+    pcall(function() firesignal(btn.MouseButton1Click) end)
+    pcall(function()
+        for _, c in ipairs(getconnections(btn.Activated)) do
+            if c.Function then c.Function() end
+        end
+    end)
+    pcall(function() firesignal(btn.Activated) end)
+    pcall(function() btn.MouseButton1Click:Fire() end)
+end
+
+local function btn_on_screen(btn)
+    local ap  = btn.AbsolutePosition
+    local asz = btn.AbsoluteSize
+    if asz.X <= 0 or asz.Y <= 0 then return false end
+    local vp  = Workspace.CurrentCamera.ViewportSize
+    return ap.X < vp.X and ap.Y < vp.Y and (ap.X+asz.X) > 0 and (ap.Y+asz.Y) > 0
+end
+
+local function scan_fire(patterns)
+    local gui = LP:FindFirstChildOfClass("PlayerGui")
+    if not gui then return end
+    for _, obj in ipairs(gui:GetDescendants()) do
+        if (obj:IsA("TextButton") or obj:IsA("ImageButton"))
+            and obj.Visible
+            and not is_own_gui(obj)
+            and btn_on_screen(obj)
+        then
+            local full = obj.Name:lower()
+                      .. (obj:IsA("TextButton") and obj.Text:lower() or "")
+            for _, pat in ipairs(patterns) do
+                if full:find(pat, 1, true) then
+                    fire_btn(obj)
+                    task.wait(0.015)
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  AUTO STEAL
+--  1. scan workspace for pack matching selected rarities
+--  2. tween directly to the pack (with AC hop bypass)
+--  3. fire steal remotes + touch trigger
+--  4. tween back to base (with AC hop bypass)
+-- ══════════════════════════════════════════════════════════════
+local STEAL_REMOTES = {
+    "StealPack", "Steal", "GrabPack", "PickupPack", "TakePack"
+}
+
+local steal_busy = false
+
+local function do_one_steal(target)
+    if steal_busy then return end
+    steal_busy    = true
+    Hum.WalkSpeed = CFG.StealSpeed
+    pcall(function() HRP:SetNetworkOwner(nil) end)
+
+    -- go to pack
+    move_to(target.part.CFrame + Vector3.new(0, 3, 0))
+
+    -- fire all steal remotes
+    for _, name in ipairs(STEAL_REMOTES) do
+        fire_remote(name, target.model)
+    end
+
+    -- touch trigger fallback
+    cancel_tween()
+    HRP.CFrame = target.part.CFrame + Vector3.new(0, 2, 0)
+    task.wait(0.06)
+
+    -- return to base via tween + AC bypass
+    local baseCF = get_base_cf()
+    move_to(baseCF)
+    cancel_tween()
+    HRP.CFrame = baseCF
+    task.wait(0.08)
+
+    steal_busy = false
+end
+
+local function auto_steal_loop()
+    while State.Stealing do
+        local t = nearest_target()
+        if t and not steal_busy then
+            do_one_steal(t)
+        else
+            task.wait(0.5)
+        end
+        task.wait(0.03)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  AUTO FARM — combo x2–x5 speed training
+-- ══════════════════════════════════════════════════════════════
+local COMBO_REMOTES = {
+    "SpeedCombo","Combo","TrainingCombo","ClickTrain","SpeedTrain","PunchTrain"
+}
+local COMBO_PATS = {
+    "x2","x3","x4","x5","2x","3x","4x","5x",
+    "combo","train","click","speed","tap","punch","hit"
+}
+
+local function auto_farm_loop()
+    while State.Farming do
+        scan_fire(COMBO_PATS)
+        for _, name in ipairs(COMBO_REMOTES) do fire_remote(name) end
+        task.wait(0.008)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  AUTO HATCH
+-- ══════════════════════════════════════════════════════════════
+local HATCH_REMOTES = {"OpenPack","HatchPack","OpenEgg","Hatch"}
+local HATCH_PATS    = {"open","hatch","ready","crack"}
+
+local function auto_hatch_loop()
+    while State.Hatching do
+        for _, name in ipairs(HATCH_REMOTES) do fire_remote(name) end
+        scan_fire(HATCH_PATS)
+        task.wait(0.2)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  AUTO PLACE
+-- ══════════════════════════════════════════════════════════════
+local PLACE_REMOTES = {"PlacePack","PlaceInBase","SetPack","EquipPack","DeployPack"}
+local PLACE_PATS    = {"place","equip","put","deploy"}
+
+local function do_one_place()
+    State.Placing = true
+    local baseCF  = get_base_cf()
+    move_to(baseCF)
+    cancel_tween()
+    HRP.CFrame = baseCF
+    task.wait(0.1)
+    for _, name in ipairs(PLACE_REMOTES) do fire_remote(name) end
+    scan_fire(PLACE_PATS)
+    task.wait(0.15)
+end
+
+local function auto_place_loop()
+    while State.Placing do
+        do_one_place()
+        task.wait(0.3)
+    end
+    State.Placing = false
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  NOTIF HOOK — watches every TextLabel for tier keywords
+--  fires do_one_steal immediately on match
+-- ══════════════════════════════════════════════════════════════
+local notif_conns = {}
+
+local function hook_label(obj)
+    if not (obj:IsA("TextLabel") or obj:IsA("TextBox")) then return end
+    local function check(txt)
+        if str_has_tier(txt) and State.Stealing and not steal_busy then
+            local t = nearest_target()
+            if t then task.spawn(do_one_steal, t) end
+        end
+    end
+    check(obj.Text)
+    local c = obj:GetPropertyChangedSignal("Text"):Connect(function()
+        check(obj.Text)
+    end)
+    table.insert(notif_conns, c)
+end
+
+local function hook_container(container)
+    for _, obj in ipairs(container:GetDescendants()) do
+        hook_label(obj)
+    end
+    local c = container.DescendantAdded:Connect(function(obj)
+        task.wait(0.03)
+        hook_label(obj)
+    end)
+    table.insert(notif_conns, c)
+end
+
+local function setup_notif_hooks()
+    local pg = LP:WaitForChild("PlayerGui")
+    for _, gui in ipairs(pg:GetChildren()) do
+        local skip = false
+        for _, n in ipairs(GUI_ROOTS) do
+            if gui.Name == n then skip = true end
+        end
+        if not skip then hook_container(gui) end
+    end
+    pg.ChildAdded:Connect(function(gui)
+        local skip = false
+        for _, n in ipairs(GUI_ROOTS) do
+            if gui.Name == n then skip = true end
+        end
+        if not skip then task.wait(0.05); hook_container(gui) end
+    end)
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+            hook_container(obj)
+        end
+    end
+    Workspace.DescendantAdded:Connect(function(obj)
+        if obj:IsA("BillboardGui") or obj:IsA("SurfaceGui") then
+            task.wait(0.05); hook_container(obj)
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+--  FLUENT WINDOW
+-- ══════════════════════════════════════════════════════════════
+local Window = Fluent:CreateWindow({
+    Title       = "Anime Pack",
+    SubTitle    = "by @Archaes `78",
+    TabWidth    = 150,
+    Size        = UDim2.fromOffset(500, 420),
+    Acrylic     = true,
+    Theme       = "Dark",
+    MinimizeKey = Enum.KeyCode.LeftControl,
+})
+
+local Tabs = {
+    Steal    = Window:AddTab({ Title = "Steal",   Icon = "sword"    }),
+    Farm     = Window:AddTab({ Title = "Farm",    Icon = "zap"      }),
+    Pack     = Window:AddTab({ Title = "Pack",    Icon = "package"  }),
+    Move     = Window:AddTab({ Title = "Move",    Icon = "move"     }),
+    Settings = Window:AddTab({ Title = "Config",  Icon = "settings" }),
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  TAB — STEAL
+-- ─────────────────────────────────────────────────────────────
+Tabs.Steal:AddParagraph({
+    Title   = "Auto Steal",
+    Content = "Scans workspace for a pack matching the selected rarity, tweens directly to it (AC hop bypass), steals it, then tweens back to base.",
+})
+
+Tabs.Steal:AddToggle("AutoSteal", {
+    Title       = "Auto Steal",
+    Description = "Scan → move to pack → steal → return to base",
+    Default     = false,
+    Callback    = function(v)
+        State.Stealing = v
+        if v then task.spawn(auto_steal_loop) end
+    end,
+})
+
+Tabs.Steal:AddToggle("NotifHook", {
+    Title       = "Notif Trigger",
+    Description = "Steals immediately when a rarity keyword appears in any GUI text",
+    Default     = true,
+    Callback    = function() end,
+})
+
+Tabs.Steal:AddParagraph({
+    Title   = "Target Rarity",
+    Content = "Toggle which rarities to target.",
+})
+
+Tabs.Steal:AddToggle("TierOmni", {
+    Title    = "Omniverse",
+    Default  = true,
+    Callback = function(v) CFG.Tiers["omniverse"] = v or nil end,
+})
+
+Tabs.Steal:AddToggle("TierEternal", {
+    Title    = "Eternal",
+    Default  = true,
+    Callback = function(v) CFG.Tiers["eternal"] = v or nil end,
+})
+
+Tabs.Steal:AddToggle("TierPrimordial", {
+    Title    = "Primordial",
+    Default  = true,
+    Callback = function(v) CFG.Tiers["primordial"] = v or nil end,
+})
+
+Tabs.Steal:AddToggle("TierGodlike", {
+    Title    = "Godlike",
+    Default  = true,
+    Callback = function(v) CFG.Tiers["godlike"] = v or nil end,
+})
+
+-- ─────────────────────────────────────────────────────────────
+--  TAB — FARM
+-- ─────────────────────────────────────────────────────────────
+Tabs.Farm:AddParagraph({
+    Title   = "Auto Farm",
+    Content = "Spams combo/training buttons (x2 x3 x4 x5) and fires training remotes every tick.",
+})
+
+Tabs.Farm:AddToggle("AutoFarm", {
+    Title       = "Auto Farm",
+    Description = "Clicks all visible combo + training buttons",
+    Default     = false,
+    Callback    = function(v)
+        State.Farming = v
+        if v then task.spawn(auto_farm_loop) end
+    end,
+})
+
+Tabs.Farm:AddButton({
+    Title       = "Set Farm Spot",
+    Description = "Save current position as farm spot",
+    Callback    = function()
+        State.FarmSpot = HRP.CFrame
+        Fluent:Notify({ Title = "Farm Spot", Content = "Saved current position as farm spot.", Duration = 2 })
+    end,
+})
+
+-- ─────────────────────────────────────────────────────────────
+--  TAB — PACK
+-- ─────────────────────────────────────────────────────────────
+Tabs.Pack:AddParagraph({
+    Title   = "Auto Hatch",
+    Content = "Fires hatch remotes and clicks open/hatch buttons every 0.2s.",
+})
+
+Tabs.Pack:AddToggle("AutoHatch", {
+    Title    = "Auto Hatch Pack",
+    Default  = false,
+    Callback = function(v)
+        State.Hatching = v
+        if v then task.spawn(auto_hatch_loop) end
+    end,
+})
+
+Tabs.Pack:AddParagraph({
+    Title   = "Auto Place",
+    Content = "Goes to base, fires place remotes and clicks place buttons. Run after hatch.",
+})
+
+Tabs.Pack:AddToggle("AutoPlace", {
+    Title    = "Auto Place in Base",
+    Default  = false,
+    Callback = function(v)
+        if v then
+            State.Placing = true
+            task.spawn(auto_place_loop)
+        else
+            State.Placing = false
+        end
+    end,
+})
+
+-- ─────────────────────────────────────────────────────────────
+--  TAB — MOVE
+-- ─────────────────────────────────────────────────────────────
+Tabs.Move:AddParagraph({
+    Title   = "Base & Speed",
+    Content = "Set your base return point and control walk speed for all features.",
+})
+
+Tabs.Move:AddButton({
+    Title       = "Set Point as Base",
+    Description = "Save current standing position as the base (return point after steal / place)",
+    Callback    = function()
+        State.Base = HRP.CFrame
+        Fluent:Notify({
+            Title   = "Base Set",
+            Content = "Current position saved as base.",
+            Duration = 2,
+        })
+    end,
+})
+
+Tabs.Move:AddButton({
+    Title       = "Teleport to Base",
+    Description = "Tween to saved base position right now",
+    Callback    = function()
+        local baseCF = get_base_cf()
+        task.spawn(function()
+            move_to(baseCF)
+        end)
+    end,
+})
+
+Tabs.Move:AddSlider("SpeedSlider", {
+    Title       = "Walk Speed",
+    Description = "Applied to all movement (200 recommended minimum to avoid AC)",
+    Default     = 500,
+    Min         = 16,
+    Max         = 2000,
+    Rounding    = 1,
+    Callback    = function(v) set_speed(v) end,
+})
+
+Tabs.Move:AddToggle("ACToggle", {
+    Title       = "AntiCheat Hop Bypass",
+    Description = "Move in small tween hops to stay under the game's delta threshold",
+    Default     = true,
+    Callback    = function(v) CFG.ACBypass = v end,
+})
+
+Tabs.Move:AddSlider("HopDistSlider", {
+    Title       = "Hop Distance (studs)",
+    Description = "Max studs per hop. Lower = safer vs AC, slower.",
+    Default     = 12,
+    Min         = 4,
+    Max         = 40,
+    Rounding    = 1,
+    Callback    = function(v) CFG.HopDist = v end,
+})
+
+-- ─────────────────────────────────────────────────────────────
+--  TAB — SETTINGS (SaveManager / InterfaceManager)
+-- ─────────────────────────────────────────────────────────────
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetFolder("LarpAnimePack")
+InterfaceManager:BuildInterfaceSection(Tabs.Settings)
+SaveManager:BuildConfigSection(Tabs.Settings)
+
+-- ══════════════════════════════════════════════════════════════
+--  BOOT
+-- ══════════════════════════════════════════════════════════════
+Window:SelectTab(1)
+
+Hum.WalkSpeed = CFG.StealSpeed
+Hum.JumpPower = 0
+pcall(function() HRP:SetNetworkOwner(nil) end)
+
+task.spawn(setup_notif_hooks)
+
+task.wait(1)
+State.Base     = HRP.CFrame
+State.FarmSpot = HRP.CFrame
+
+Fluent:Notify({
+    Title    = "larp anime pack v6",
+    Content  = "loaded — @Archaes `78 | set your base in Move tab",
+    Duration = 5,
+})
